@@ -1,0 +1,306 @@
+import time
+import requests
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import logging
+import sys
+import altair as alt
+import streamlit as st
+from statsmodels.tsa.arima.model import ARIMA
+from sklearn.preprocessing import MinMaxScaler
+from scipy.signal import savgol_filter
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# --- 1. System Config ---
+st.set_page_config(
+    page_title="xAI Institutional",
+    page_icon="⚡",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Detect Hardware
+if torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+elif torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
+else:
+    DEVICE = torch.device("cpu")
+
+HEADERS = {'User-Agent': 'Mozilla/5.0'}
+logging.basicConfig(level=logging.ERROR)
+
+# --- 2. Advanced AI Model (Price + Volume) ---
+class InstitutionalBiGRU(nn.Module):
+    def __init__(self):
+        super(InstitutionalBiGRU, self).__init__()
+        # Input Size 2: [Price Log Return, Volume Log Change]
+        # This adds the "Conviction" dimension.
+        self.gru = nn.GRU(input_size=2, hidden_size=64, bidirectional=True, batch_first=True)
+        self.dropout = nn.Dropout(0.2)
+        self.fc = nn.Linear(128, 1)
+
+    def forward(self, x):
+        _, h = self.gru(x)
+        h = torch.cat((h[0], h[1]), dim=1)
+        return self.fc(self.dropout(h))
+
+# --- 3. Mathematical Engines ---
+def prepare_institutional_data(df):
+    """
+    Feeds the AI two dimensions:
+    1. Momentum (Log Returns)
+    2. Liquidity/Conviction (Log Volume Changes)
+    """
+    closes = df['close'].values
+    volumes = df['volume'].values
+    
+    # 1. Price Momentum (Log Returns)
+    log_ret = np.diff(np.log(closes + 1e-9))
+    log_ret = np.insert(log_ret, 0, 0)
+    
+    # 2. Volume Conviction (Log Change)
+    # Smooth volume first to remove outliers
+    vol_smooth = savgol_filter(volumes, 11, 3) if len(volumes) > 11 else volumes
+    log_vol = np.diff(np.log(vol_smooth + 1e-9))
+    log_vol = np.insert(log_vol, 0, 0)
+    
+    # Scale Inputs (-1 to 1)
+    scaler = MinMaxScaler(feature_range=(-1, 1))
+    
+    # Stack features: [Rows, 2 columns]
+    features = np.column_stack((log_ret, log_vol))
+    scaled_features = scaler.fit_transform(features)
+    
+    return scaled_features, scaler, log_ret
+
+def calculate_risk_score(log_returns):
+    """
+    Calculates a layman 'Risk Score' (0-10) based on volatility.
+    0 = Stable (Stablecoin)
+    10 = Extreme Danger (Meme coin)
+    """
+    volatility = np.std(log_returns) * 100
+    # Normalize roughly: 0.1% std dev is low, 2.0% is high
+    score = min(10, (volatility / 1.5) * 10)
+    return round(score, 1)
+
+# --- 4. Data Layer ---
+@st.cache_data(ttl=300)
+def fetch_data_package(pair):
+    url = f"https://api.kraken.com/0/public/OHLC?pair={pair}&interval=15"
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=3).json()
+        if resp.get('error'): return None
+        key = [k for k in resp['result'].keys() if k != 'last'][0]
+        data = resp['result'][key]
+        
+        arr = np.array(data, dtype=object)
+        df = pd.DataFrame(arr, columns=['time', 'o', 'h', 'l', 'close', 'vwap', 'volume', 'cnt'])
+        df = df[['time', 'close', 'volume']].astype(float)
+        df['time'] = pd.to_datetime(df['time'], unit='s')
+        return df
+    except:
+        return None
+
+# --- 5. Analysis Core ---
+def analyze_market_asset(pair_info):
+    pair = pair_info['pair']
+    df = fetch_data_package(pair)
+    
+    if df is None or len(df) < 100: return None
+    
+    current_price = df['close'].iloc[-1]
+    
+    # A. AI Prediction (Price + Volume)
+    try:
+        scaled_data, scaler, log_rets = prepare_institutional_data(df)
+        
+        # Prepare Tensors (Last 120 candles)
+        X_raw = scaled_data[-120:-1]
+        y_target = scaled_data[-120:, 0][1:] # Target is Price Return
+        
+        X = torch.tensor(X_raw, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+        y = torch.tensor(y_target, dtype=torch.float32).unsqueeze(0).unsqueeze(2).to(DEVICE)
+        
+        model = InstitutionalBiGRU().to(DEVICE)
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
+        loss_fn = nn.MSELoss()
+        
+        model.train()
+        for _ in range(25): # Rapid training
+            optimizer.zero_grad()
+            out = model(X)
+            loss = loss_fn(out, y)
+            loss.backward()
+            optimizer.step()
+            
+        model.eval()
+        with torch.no_grad():
+            last_input = torch.tensor(scaled_data[-1], dtype=torch.float32).view(1, 1, 2).to(DEVICE)
+            pred_scaled = model(last_input).item()
+            
+            # Inverse Transform (Trickier with 2D scaler, need dummy volume)
+            dummy = np.array([[pred_scaled, 0]]) 
+            pred_log_ret = scaler.inverse_transform(dummy)[0][0]
+            
+            # Projected Price
+            pred_price = current_price * np.exp(pred_log_ret)
+            ai_gain_pct = ((pred_price - current_price) / current_price) * 100 * 4.0 # 4h Projection
+            
+    except Exception as e:
+        ai_gain_pct = 0.0
+
+    # B. Risk Analysis
+    risk_score = calculate_risk_score(log_rets)
+    
+    # C. Trend Sparkline (Last 20 points for UI)
+    # We normalize these for the sparkline chart 0-1
+    recent_trend = df['close'].tail(24).tolist()
+    
+    # D. Final Verdict
+    # Penalize gain if risk is extreme (>8.0)
+    adjusted_score = ai_gain_pct * (0.5 if risk_score > 8.0 else 1.0)
+    
+    return {
+        "ticker": pair,
+        "price": current_price,
+        "change_24h": pair_info['change'],
+        "ai_score": adjusted_score,
+        "risk_score": risk_score,
+        "trend_data": recent_trend # List of floats for Sparkline
+    }
+
+# --- 6. Dashboard Layout ---
+def dashboard():
+    # CSS for "Cards" and modern look
+    st.markdown("""
+        <style>
+        div[data-testid="stMetric"] {
+            background-color: #1E1E1E;
+            padding: 15px;
+            border-radius: 10px;
+            border: 1px solid #333;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
+    st.title("⚡ xAI Institutional")
+    st.markdown("### Market Intelligence Dashboard")
+    
+    # Initialize State
+    if 'analysis' not in st.session_state:
+        st.session_state.analysis = []
+
+    # Sidebar
+    with st.sidebar:
+        st.header("📡 Radar Settings")
+        scan_depth = st.slider("Market Depth (Pairs)", 10, 100, 30)
+        min_volatility = st.slider("Min Volatility (%)", 1, 10, 2)
+        
+        st.info("**New Dimension:** \nAI now analyzes **Volume Conviction**. \nPrice moves with low volume are flagged as fake.")
+        
+        if st.button("Start Scan", type="primary"):
+            st.session_state.analysis = []
+            
+            with st.status("Scanning Market Liquidity...", expanded=True) as status:
+                st.write("Fetching Order Books...")
+                # 1. Fetch Tickers
+                pairs = requests.get("https://api.kraken.com/0/public/AssetPairs", headers=HEADERS).json()['result']
+                usd_pairs = {k: v['wsname'] for k, v in pairs.items() if k.endswith("USD") and "wsname" in v}
+                tickers = requests.get(f"https://api.kraken.com/0/public/Ticker?pair={','.join(list(usd_pairs.keys())[:150])}", headers=HEADERS).json()['result']
+                
+                candidates = []
+                for k, v in tickers.items():
+                    if k in usd_pairs:
+                        chg = (float(v['c'][0]) / float(v['o']) - 1) * 100
+                        if abs(chg) > min_volatility:
+                            candidates.append({'pair': k, 'change': chg})
+                
+                candidates = sorted(candidates, key=lambda x: x['change'], reverse=True)[:scan_depth]
+                
+                # 2. Parallel Processing
+                st.write(f"Running Neural Networks on {DEVICE}...")
+                prog = st.progress(0)
+                
+                with ThreadPoolExecutor(max_workers=8) as exe:
+                    futures = {exe.submit(analyze_market_asset, c): c for c in candidates}
+                    completed = 0
+                    for f in as_completed(futures):
+                        res = f.result()
+                        completed += 1
+                        prog.progress(completed/len(candidates))
+                        if res and res['ai_score'] > 0.1:
+                            st.session_state.analysis.append(res)
+                
+                status.update(label="Intelligence Gathered", state="complete")
+
+    # Main Display
+    if st.session_state.analysis:
+        df = pd.DataFrame(st.session_state.analysis).sort_values('ai_score', ascending=False)
+        
+        # --- HERO SECTION (Top 3) ---
+        top_picks = df.head(3)
+        cols = st.columns(3)
+        for i, (index, row) in enumerate(top_picks.iterrows()):
+            with cols[i]:
+                st.metric(
+                    label=f"#{i+1} {row['ticker']}",
+                    value=f"${row['price']:.4f}",
+                    delta=f"AI: +{row['ai_score']:.2f}%"
+                )
+                if row['risk_score'] < 3:
+                    st.caption("🛡️ **Low Risk / High Conviction**")
+                elif row['risk_score'] > 7:
+                    st.caption("🔥 **High Volatility Play**")
+                else:
+                    st.caption("⚖️ **Balanced Setup**")
+
+        st.divider()
+        
+        # --- DETAILED LEDGER ---
+        st.subheader("Live Opportunity Ledger")
+        
+        # We prepare a display DF
+        display_df = df.copy()
+        display_df['Confidence'] = display_df['ai_score'] # For progress bar
+        
+        st.dataframe(
+            display_df,
+            column_order=("ticker", "trend_data", "price", "change_24h", "risk_score", "Confidence"),
+            column_config={
+                "ticker": "Asset",
+                "price": st.column_config.NumberColumn("Price", format="$%.4f"),
+                "change_24h": st.column_config.NumberColumn("24h Change", format="%.2f%%"),
+                "risk_score": st.column_config.NumberColumn(
+                    "Risk (0-10)", 
+                    help="0 is stable, 10 is chaotic.",
+                    format="%.1f"
+                ),
+                # THE LAYMAN VISUALS
+                "trend_data": st.column_config.LineChartColumn(
+                    "24h Trend",
+                    width="medium",
+                    y_min=None, y_max=None 
+                ),
+                "Confidence": st.column_config.ProgressColumn(
+                    "AI Conviction",
+                    format="%.2f%% upside",
+                    min_value=0,
+                    max_value=max(df['ai_score'])
+                ),
+            },
+            hide_index=True,
+            use_container_width=True
+        )
+        
+        # --- EXPLANATION SECTION ---
+        with st.expander("How to read this dashboard (Layman's Guide)"):
+            st.markdown("""
+            1. **24h Trend (Sparkline):** Shows the shape of the price today. Look for lines pointing up.
+            2. **Risk (0-10):** - **0-3:** Safe, steady movers (like Bitcoin/Ethereum).
+               - **4-7:** Moderate volatility.
+               - **8-10:** Extreme risk (Meme coins). Only trade if you accept high loss potential.
+            3. **AI Conviction:**
